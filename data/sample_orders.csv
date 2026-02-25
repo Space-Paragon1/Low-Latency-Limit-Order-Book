@@ -1,0 +1,64 @@
+# Low-Latency Limit Order Book — sample replay data
+# Format: timestamp,symbol,type,order_id,side,price,qty[,new_order_id,new_price,new_qty]
+# Price unit: dollars with 2 decimal places (e.g. 100.50 → stored as 10050 ticks)
+# Timestamp: nanoseconds (arbitrary monotonic)
+
+# ── Build initial AAPL book ───────────────────────────────────────────────────
+1000000000,AAPL,LIMIT,1,BUY,99.50,200
+1000000100,AAPL,LIMIT,2,BUY,99.00,300
+1000000200,AAPL,LIMIT,3,BUY,98.50,500
+1000000300,AAPL,LIMIT,4,SELL,100.50,200
+1000000400,AAPL,LIMIT,5,SELL,101.00,300
+1000000500,AAPL,LIMIT,6,SELL,101.50,400
+
+# ── Simple full match (BUY crosses ask) ──────────────────────────────────────
+# Order 7 buys at 100.50 → matches order 4 exactly (200 @ 100.50)
+1000001000,AAPL,LIMIT,7,BUY,100.50,200
+
+# ── Partial fill – aggressor leaves remainder ─────────────────────────────────
+# Order 8 sells 150 @ 99.50 → matches 150 of order 1 (partial), leaves 50 on bid
+1000002000,AAPL,LIMIT,8,SELL,99.50,150
+
+# ── Partial fill – resting order depleted across multiple aggressors ──────────
+# Order 9 sells another 100 → consumes remaining 50 of order 1 + 50 of order 2
+1000003000,AAPL,LIMIT,9,SELL,99.00,100
+
+# ── Market order buy – sweeps best ask ───────────────────────────────────────
+# No resting asks remain at 100.50; best ask is now 101.00 (order 5)
+# Market buy 400 → consumes 300 of order 5 + 100 of order 6
+1000004000,AAPL,MARKET,10,BUY,0,400
+
+# ── Cancel ────────────────────────────────────────────────────────────────────
+# Cancel order 3 (BUY 98.50, 500 qty – still fully resting)
+1000005000,AAPL,CANCEL,3,BUY,0,0
+
+# Cancel order 2 (partially consumed: 250 remaining)
+1000005100,AAPL,CANCEL,2,BUY,0,0
+
+# ── Replace / modify ──────────────────────────────────────────────────────────
+# Replace order 6 (SELL 101.50, 300 remaining) with order 11 at 100.00, qty 250
+# This triggers an immediate match against any resting bids ≥ 100.00
+1000006000,AAPL,REPLACE,6,SELL,101.50,300,11,100.00,250
+
+# ── MSFT: independent symbol ──────────────────────────────────────────────────
+2000000000,MSFT,LIMIT,100,BUY,300.00,1000
+2000000100,MSFT,LIMIT,101,SELL,300.50,500
+2000000200,MSFT,LIMIT,102,BUY,300.50,300
+# Order 102 crosses ask 101 → match 300 @ 300.50, order 101 has 200 remaining
+
+# MSFT market sell 200 → consumes remainder of order 101 (ask side)
+2000001000,MSFT,MARKET,103,SELL,0,200
+
+# ── Edge cases ────────────────────────────────────────────────────────────────
+# Zero-crossing: BUY and SELL at different non-crossing prices (no match)
+3000000000,AAPL,LIMIT,200,BUY,95.00,1000
+3000000100,AAPL,LIMIT,201,SELL,110.00,1000
+
+# Cancel a non-existent order (engine silently ignores)
+3000001000,AAPL,CANCEL,999,BUY,0,0
+
+# Large sweep: single BUY sweeps multiple ask levels
+3000002000,AAPL,LIMIT,202,SELL,96.00,100
+3000002100,AAPL,LIMIT,203,SELL,97.00,100
+3000002200,AAPL,LIMIT,204,SELL,98.00,100
+3000003000,AAPL,LIMIT,205,BUY,110.00,350
