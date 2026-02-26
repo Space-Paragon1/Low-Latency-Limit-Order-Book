@@ -14,10 +14,12 @@ using Timestamp = uint64_t;   // nanoseconds since epoch (or arbitrary monotonic
 enum class Side : uint8_t { BUY = 0, SELL = 1 };
 
 enum class OrderType : uint8_t {
-    LIMIT   = 0,
-    MARKET  = 1,
-    CANCEL  = 2,
-    REPLACE = 3
+    LIMIT        = 0,
+    MARKET       = 1,
+    CANCEL       = 2,
+    REPLACE      = 3,
+    STOP_MARKET  = 4,   // triggers a market order when last_trade_price crosses stop_price
+    STOP_LIMIT   = 5    // triggers a limit order  when last_trade_price crosses stop_price
 };
 
 enum class OrderStatus : uint8_t {
