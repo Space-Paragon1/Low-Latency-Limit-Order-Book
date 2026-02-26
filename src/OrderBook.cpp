@@ -108,6 +108,7 @@ std::vector<Trade> OrderBook::matchBuy(Order& aggressor, Timestamp ts) {
                 ts, symbol_, resting.price, fill,
                 Side::BUY, rest_id, aggressor.id
             });
+            last_trade_price_ = resting.price;
 
             aggressor.qty_remaining -= fill;
             resting.qty_remaining   -= fill;
@@ -157,6 +158,7 @@ std::vector<Trade> OrderBook::matchSell(Order& aggressor, Timestamp ts) {
                 ts, symbol_, resting.price, fill,
                 Side::SELL, rest_id, aggressor.id
             });
+            last_trade_price_ = resting.price;
 
             aggressor.qty_remaining -= fill;
             resting.qty_remaining   -= fill;
@@ -182,8 +184,10 @@ std::vector<Trade> OrderBook::matchSell(Order& aggressor, Timestamp ts) {
     return trades;
 }
 
-// ─── addLimit ─────────────────────────────────────────────────────────────────
-MatchResult OrderBook::addLimit(const OrderEvent& event) {
+// ─── addLimitInternal ─────────────────────────────────────────────────────────
+// Pure matching logic; does NOT check stop triggers. Called by the public
+// addLimit wrapper and by executeStop (to avoid re-entrant trigger checking).
+MatchResult OrderBook::addLimitInternal(const OrderEvent& event) {
     if (event.qty == 0) return {};
 
     Order o;
@@ -214,8 +218,9 @@ MatchResult OrderBook::addLimit(const OrderEvent& event) {
     return MatchResult{std::move(trades), snapshotChanged(snap)};
 }
 
-// ─── addMarket ────────────────────────────────────────────────────────────────
-MatchResult OrderBook::addMarket(const OrderEvent& event) {
+// ─── addMarketInternal ────────────────────────────────────────────────────────
+// Pure matching logic; does NOT check stop triggers.
+MatchResult OrderBook::addMarketInternal(const OrderEvent& event) {
     if (event.qty == 0) return {};
 
     Order o;
@@ -264,6 +269,7 @@ bool OrderBook::cancel(OrderId id, Timestamp /*ts*/) {
 
 // ─── replace ──────────────────────────────────────────────────────────────────
 // Semantics: cancel original order (loses time priority), submit new limit.
+// Uses the public addLimit so that stop orders are checked after the new limit matches.
 MatchResult OrderBook::replace(const OrderEvent& event) {
     cancel(event.order_id, event.timestamp);
 
@@ -273,5 +279,140 @@ MatchResult OrderBook::replace(const OrderEvent& event) {
     neo.qty          = event.new_qty;
     neo.type         = OrderType::LIMIT;
 
-    return addLimit(neo);
+    return addLimit(neo);   // public wrapper: matches + checks stops
+}
+
+// ─── addLimit (public wrapper) ────────────────────────────────────────────────
+// Delegates to addLimitInternal then checks for triggered stop orders.
+MatchResult OrderBook::addLimit(const OrderEvent& event) {
+    MatchResult result = addLimitInternal(event);
+    checkAndTriggerStops(result, event.timestamp);
+    return result;
+}
+
+// ─── addMarket (public wrapper) ───────────────────────────────────────────────
+// Delegates to addMarketInternal then checks for triggered stop orders.
+MatchResult OrderBook::addMarket(const OrderEvent& event) {
+    MatchResult result = addMarketInternal(event);
+    checkAndTriggerStops(result, event.timestamp);
+    return result;
+}
+
+// ─── Stop order helpers ───────────────────────────────────────────────────────
+
+bool OrderBook::isStopTriggered(const StopEntry& entry) const {
+    if (last_trade_price_ == 0) return false;   // no trades yet; never trigger
+    if (entry.side == Side::BUY)
+        return last_trade_price_ >= entry.stop_price;
+    else
+        return last_trade_price_ <= entry.stop_price;
+}
+
+// Execute a triggered stop by converting it into a market or limit order.
+// Calls the *Internal variants to avoid re-entrant stop checking.
+// Merges the resulting trades and tob_changed flag into 'accumulated'.
+void OrderBook::executeStop(const StopEntry& entry,
+                            MatchResult& accumulated,
+                            Timestamp ts) {
+    OrderEvent synthetic;
+    synthetic.timestamp = ts;
+    synthetic.symbol    = symbol_;
+    synthetic.order_id  = entry.id;
+    synthetic.side      = entry.side;
+    synthetic.qty       = entry.qty;
+
+    MatchResult sub;
+    if (entry.type == OrderType::STOP_MARKET) {
+        synthetic.type  = OrderType::MARKET;
+        synthetic.price = (entry.side == Side::BUY) ? INT64_MAX : 0;
+        sub = addMarketInternal(synthetic);
+    } else {
+        synthetic.type  = OrderType::LIMIT;
+        synthetic.price = entry.limit_price;
+        sub = addLimitInternal(synthetic);
+    }
+
+    accumulated.trades.insert(
+        accumulated.trades.end(),
+        std::make_move_iterator(sub.trades.begin()),
+        std::make_move_iterator(sub.trades.end())
+    );
+    accumulated.tob_changed |= sub.tob_changed;
+}
+
+// Check and fire any stop orders triggered by the current last_trade_price_.
+// Iterates until no new stops fire (handles cascades where a triggered stop
+// produces trades that trigger further stops).
+void OrderBook::checkAndTriggerStops(MatchResult& accumulated, Timestamp ts) {
+    if (last_trade_price_ == 0) return;   // no trades yet; nothing to check
+
+    bool any_triggered = true;
+    while (any_triggered) {
+        any_triggered = false;
+
+        // Buy stops: trigger when last_trade_price_ >= stop_price.
+        // buy_stops_ is ascending → begin() has the lowest stop_price.
+        while (!buy_stops_.empty() &&
+               last_trade_price_ >= buy_stops_.begin()->first) {
+            auto& q = buy_stops_.begin()->second;
+            while (!q.empty()) {
+                StopEntry entry = q.front();
+                q.pop_front();
+                executeStop(entry, accumulated, ts);
+                any_triggered = true;
+            }
+            buy_stops_.erase(buy_stops_.begin());
+        }
+
+        // Sell stops: trigger when last_trade_price_ <= stop_price.
+        // sell_stops_ is descending → begin() has the highest stop_price.
+        while (!sell_stops_.empty() &&
+               last_trade_price_ <= sell_stops_.begin()->first) {
+            auto& q = sell_stops_.begin()->second;
+            while (!q.empty()) {
+                StopEntry entry = q.front();
+                q.pop_front();
+                executeStop(entry, accumulated, ts);
+                any_triggered = true;
+            }
+            sell_stops_.erase(sell_stops_.begin());
+        }
+    }
+}
+
+// ─── addStop ──────────────────────────────────────────────────────────────────
+// Register a stop order. If the stop is already past the trigger threshold
+// (e.g., the market gapped through it), execute it immediately.
+// Otherwise, enqueue it to fire when price crosses stop_price.
+MatchResult OrderBook::addStop(const OrderEvent& event) {
+    if (event.qty == 0)    return {};
+    if (event.price == 0)  return {};   // stop_price must be non-zero
+    // STOP_LIMIT requires a valid limit price
+    if (event.type == OrderType::STOP_LIMIT && event.limit_price == 0) return {};
+
+    StopEntry entry{
+        event.order_id,
+        event.type,
+        event.side,
+        event.price,        // stop_price (trigger level)
+        event.limit_price,  // 0 for STOP_MARKET
+        event.qty,
+        event.timestamp
+    };
+
+    if (isStopTriggered(entry)) {
+        // Price has already crossed the stop_price; fire immediately.
+        MatchResult result;
+        executeStop(entry, result, event.timestamp);
+        checkAndTriggerStops(result, event.timestamp);  // handle cascade
+        return result;
+    }
+
+    // Enqueue for future triggering.
+    if (event.side == Side::BUY)
+        buy_stops_[event.price].push_back(entry);
+    else
+        sell_stops_[event.price].push_back(entry);
+
+    return {};  // stop is resting; no immediate trades, no TOB change
 }
