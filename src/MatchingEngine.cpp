@@ -54,6 +54,11 @@ void MatchingEngine::processEvent(const OrderEvent& event) {
         case OrderType::REPLACE:
             result = book.replace(event);
             break;
+
+        case OrderType::STOP_MARKET:   // fall-through: both routed to addStop
+        case OrderType::STOP_LIMIT:
+            result = book.addStop(event);
+            break;
     }
 
     publish(result, event.symbol, event.timestamp);
