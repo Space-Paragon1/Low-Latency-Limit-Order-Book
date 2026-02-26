@@ -69,10 +69,12 @@ std::optional<OrderEvent> MessageParser::parseCSVLine(const std::string& line) {
         // type
         std::string tp = fields[2];
         for (auto& c : tp) c = static_cast<char>(std::toupper(c));
-        if      (tp == "LIMIT")   ev.type = OrderType::LIMIT;
-        else if (tp == "MARKET")  ev.type = OrderType::MARKET;
-        else if (tp == "CANCEL")  ev.type = OrderType::CANCEL;
-        else if (tp == "REPLACE") ev.type = OrderType::REPLACE;
+        if      (tp == "LIMIT")        ev.type = OrderType::LIMIT;
+        else if (tp == "MARKET")       ev.type = OrderType::MARKET;
+        else if (tp == "CANCEL")       ev.type = OrderType::CANCEL;
+        else if (tp == "REPLACE")      ev.type = OrderType::REPLACE;
+        else if (tp == "STOP_MARKET")  ev.type = OrderType::STOP_MARKET;
+        else if (tp == "STOP_LIMIT")   ev.type = OrderType::STOP_LIMIT;
         else return std::nullopt;
 
         ev.order_id = std::stoull(fields[3]);
@@ -86,6 +88,14 @@ std::optional<OrderEvent> MessageParser::parseCSVLine(const std::string& line) {
 
         ev.price = parsePriceTicks(fields[5]);
         ev.qty   = std::stoull(fields[6]);
+
+        // Stop order: field[5]=stop_price (stored in ev.price), field[7]=limit_price.
+        // For STOP_MARKET, limit_price is 0 (CSV conventionally contains "0").
+        // For STOP_LIMIT,  limit_price is the price of the triggered limit order.
+        if ((ev.type == OrderType::STOP_MARKET || ev.type == OrderType::STOP_LIMIT)
+            && fields.size() >= 8) {
+            ev.limit_price = parsePriceTicks(fields[7]);
+        }
 
         // REPLACE optional trailing fields
         if (ev.type == OrderType::REPLACE && fields.size() >= 10) {
