@@ -16,7 +16,7 @@ buyers/sellers, and outputs trade prints and top-of-book (TOB) market data.
 | Property | Detail |
 |---|---|
 | **Priority** | Price-time (FIFO within each price level) |
-| **Order types** | LIMIT, MARKET, CANCEL, REPLACE |
+| **Order types** | LIMIT, MARKET, CANCEL, REPLACE, STOP_MARKET, STOP_LIMIT |
 | **Fill types** | Full fill & partial fill |
 | **Trade price** | Resting order's price |
 | **Market orders** | Never rest; unmatched qty silently discarded |
@@ -49,12 +49,15 @@ buyers/sellers, and outputs trade prints and top-of-book (TOB) market data.
 
 ```
 OrderBook (per symbol)
-├── bids_  : std::map<Price, std::deque<OrderId>, std::greater<Price>>
-│             highest bid price → front; FIFO deque per level
-├── asks_  : std::map<Price, std::deque<OrderId>>
-│             lowest ask price → front; FIFO deque per level
-└── orders_: std::unordered_map<OrderId, Order>
-              authoritative order state (price, qty_remaining, status)
+├── bids_      : std::map<Price, std::deque<OrderId>, std::greater<Price>>
+│                 highest bid price → front; FIFO deque per level
+├── asks_      : std::map<Price, std::deque<OrderId>>
+│                 lowest ask price → front; FIFO deque per level
+├── orders_    : std::unordered_map<OrderId, Order>
+│                 authoritative order state (price, qty_remaining, status)
+├── buy_stops_ : std::map<Price, StopOrder>   (ascending — trigger lowest first)
+└── sell_stops_: std::map<Price, StopOrder, std::greater<Price>>
+                  (descending — trigger highest first)
 ```
 
 `std::map` gives **O(log n)** best-price access and level iteration.
@@ -123,7 +126,7 @@ Expected output:
 [ RUN  ] buy_aggresses_resting_ask
 [ OK   ] buy_aggresses_resting_ask
 ...
-25 / 25 tests passed
+34 / 34 tests passed
 ```
 
 ---
@@ -192,21 +195,39 @@ Sample output (MSVC 19.44 /O2, Windows 11, measured on this machine):
 ## Input CSV Format
 
 ```
-timestamp,symbol,type,order_id,side,price,qty[,new_order_id,new_price,new_qty]
+# Standard orders
+timestamp,symbol,type,order_id,side,price,qty
+
+# REPLACE
+timestamp,symbol,REPLACE,old_id,side,price,qty,new_id,new_price,new_qty
+
+# STOP_MARKET
+timestamp,symbol,STOP_MARKET,id,side,stop_price,qty,0
+
+# STOP_LIMIT
+timestamp,symbol,STOP_LIMIT,id,side,stop_price,qty,limit_price
 ```
 
 | Field | Type | Notes |
 |---|---|---|
 | `timestamp` | uint64 | Nanoseconds (monotonic) |
 | `symbol` | string | E.g. `AAPL`, `MSFT` |
-| `type` | string | `LIMIT` \| `MARKET` \| `CANCEL` \| `REPLACE` |
+| `type` | string | `LIMIT` \| `MARKET` \| `CANCEL` \| `REPLACE` \| `STOP_MARKET` \| `STOP_LIMIT` |
 | `order_id` | uint64 | Unique order identifier |
 | `side` | string | `BUY` \| `SELL` |
 | `price` | decimal | Dollars e.g. `150.25` (stored as 15025 ticks = $0.01 units) |
 | `qty` | uint64 | Quantity; ignored for CANCEL |
+| `stop_price` | decimal | STOP_MARKET / STOP_LIMIT: price that triggers the order |
+| `limit_price` | decimal | STOP_LIMIT only: limit price used after trigger |
 | `new_order_id` | uint64 | REPLACE only |
 | `new_price` | decimal | REPLACE only |
 | `new_qty` | uint64 | REPLACE only |
+
+**Stop order trigger rules:**
+- **Buy stop**: triggers when `last_trade_price >= stop_price` → submits a market or limit buy
+- **Sell stop**: triggers when `last_trade_price <= stop_price` → submits a market or limit sell
+- Stops are checked after every `LIMIT` or `MARKET` order; cascading triggers are handled iteratively.
+- No trigger occurs until at least one trade has printed (cold-book guard).
 
 Lines beginning with `#` are treated as comments.
 
@@ -266,7 +287,7 @@ Prices are written in dollar notation (`150.25`).
 │   └── main.cpp             ← Replay entry point
 ├── tests/
 │   ├── test_framework.h     ← Zero-dependency test macros
-│   └── test_engine.cpp      ← 25 unit tests
+│   └── test_engine.cpp      ← 34 unit tests (25 core + 9 stop-order)
 ├── benchmark/
 │   └── benchmark.cpp        ← Synthetic load generator + p50/p95/p99 stats
 └── data/
@@ -281,7 +302,7 @@ Prices are written in dollar notation (`150.25`).
 |---|---|
 | Full L2 depth snapshot | `OrderBook::getDepth(int levels)` |
 | IOC / FOK order types | `OrderBook::addLimit()` with fill-or-cancel flag |
-| Stop orders | Priority queue in `MatchingEngine::processEvent()` |
+| ~~Stop orders~~ | ✅ Implemented — `buy_stops_` / `sell_stops_` in `OrderBook`; cascading via `checkAndTriggerStops()` |
 | Socket feed (live mode) | New `NetworkFeed` class calling `engine.processEvent()` |
 | Memory pooling | Replace `new Order` with a `boost::pool` or custom slab |
 | Lock-free structures | Replace `std::map` with a skip-list or Abseil's B-tree |
