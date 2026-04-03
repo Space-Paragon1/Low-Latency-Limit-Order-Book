@@ -92,16 +92,6 @@ powershell -ExecutionPolicy Bypass -File configure.ps1
 
 ## Usage
 
-### Step 0 — navigate to the project folder
-
-```powershell
-cd "C:\Users\DELL\OneDrive - Grambling State University\Desktop\Low-Latency-Limit-Order-Book"
-```
-
-> All commands below assume you are already in this folder.
-
----
-
 ### Step 1 — Build everything + run all tests
 
 ```powershell
@@ -113,7 +103,7 @@ This loads the VS 2022 build tools, compiles all targets (`lob_core`, `lob_main`
 
 ---
 
-### Step 2 — Run unit tests (standalone)
+### Step 2 — Run unit tests
 
 ```powershell
 .\build\lob_tests.exe

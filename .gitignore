@@ -1,0 +1,26 @@
+# Build output
+build/
+
+# Compiled binaries and objects
+*.exe
+*.lib
+*.dll
+*.obj
+*.o
+*.a
+
+# Generated output files
+output/
+
+# CMake user files
+CMakeUserPresets.json
+
+# IDE and editor files
+.vs/
+*.user
+*.suo
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
