@@ -1,5 +1,5 @@
 # Low-Latency Limit Order Book — sample replay data
-# Format: timestamp,symbol,type,order_id,side,price,qty[,new_order_id,new_price,new_qty]
+# Format: timestamp,symbol,type,order_id,side,price,qty[,...]  (full spec in README.md)
 # Price unit: dollars with 2 decimal places (e.g. 100.50 → stored as 10050 ticks)
 # Timestamp: nanoseconds (arbitrary monotonic)
 
@@ -37,7 +37,7 @@
 
 # ── Replace / modify ──────────────────────────────────────────────────────────
 # Replace order 6 (SELL 101.50, 300 remaining) with order 11 at 100.00, qty 250
-# This triggers an immediate match against any resting bids ≥ 100.00
+# Would match any resting bid ≥ 100.00; none remain, so it rests as the new best ask
 1000006000,AAPL,REPLACE,6,SELL,101.50,300,11,100.00,250
 
 # ── MSFT: independent symbol ──────────────────────────────────────────────────
@@ -46,7 +46,7 @@
 2000000200,MSFT,LIMIT,102,BUY,300.50,300
 # Order 102 crosses ask 101 → match 300 @ 300.50, order 101 has 200 remaining
 
-# MSFT market sell 200 → consumes remainder of order 101 (ask side)
+# MSFT market sell 200 → hits the best bid: 200 of order 100 @ 300.00
 2000001000,MSFT,MARKET,103,SELL,0,200
 
 # ── Edge cases ────────────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@
 3000000000,AAPL,LIMIT,200,BUY,95.00,1000
 3000000100,AAPL,LIMIT,201,SELL,110.00,1000
 
-# Cancel a non-existent order (engine silently ignores)
+# Cancel a non-existent order → rejected with UNKNOWN_ORDER (reported by lob_main)
 3000001000,AAPL,CANCEL,999,BUY,0,0
 
 # Large sweep: single BUY sweeps multiple ask levels

@@ -1,5 +1,10 @@
 # Build output
 build/
+out/
+cmake-build-*/
+
+# Replay output (lob_main writes here in the README examples)
+output/
 
 # Compiled binaries and objects
 *.exe
@@ -8,19 +13,20 @@ build/
 *.obj
 *.o
 *.a
-
-# Generated output files
-output/
+*.pdb
 
 # CMake user files
 CMakeUserPresets.json
+compile_commands.json
 
-# IDE and editor files
+# IDE, editor and OS files
 .vs/
-*.user
-*.suo
 .vscode/
 .idea/
+.cache/
+*.user
+*.suo
+.DS_Store
 
 # Claude Code local settings
 .claude/settings.local.json

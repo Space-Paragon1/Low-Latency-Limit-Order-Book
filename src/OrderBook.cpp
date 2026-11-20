@@ -1,418 +1,494 @@
-#include "OrderBook.h"
+#include "lob/OrderBook.h"
+
 #include <algorithm>
-#include <stdexcept>
-#include <climits>
 
-// ─────────────────────────────────────────────────────────────────────────────
-OrderBook::OrderBook(std::string symbol) : symbol_(std::move(symbol)) {}
+namespace lob {
 
-// ─── TOB helpers ──────────────────────────────────────────────────────────────
-Price OrderBook::bestBidPrice() const {
-    return bids_.empty() ? 0 : bids_.begin()->first;
+using detail::OrderNode;
+using detail::PriceLevel;
+
+namespace {
+
+// Does an aggressor with limit `limit` reach a resting level at `resting`?
+constexpr bool reaches(Side aggressor, Price limit, Price resting) noexcept {
+    return aggressor == Side::BUY ? limit >= resting : limit <= resting;
 }
 
-Price OrderBook::bestAskPrice() const {
-    return asks_.empty() ? 0 : asks_.begin()->first;
+constexpr std::size_t kOrderChunk = 4096;   // growth increment once the reservation is used up
+constexpr std::size_t kLevelChunk = 1024;
+
+}  // namespace
+
+OrderBook::OrderBook(Symbol symbol, std::size_t expected_orders)
+    : symbol_(symbol),
+      orders_(expected_orders),
+      order_pool_(kOrderChunk),
+      level_pool_(kLevelChunk) {
+    order_pool_.reserve(expected_orders);
+    trades_.reserve(256);
+    elected_.reserve(64);
 }
 
-// Sum all qty_remaining for orders at the best price level.
-Qty OrderBook::bestBidQty() const {
-    if (bids_.empty()) return 0;
-    Qty total = 0;
-    for (OrderId id : bids_.begin()->second) {
-        auto it = orders_.find(id);
-        if (it != orders_.end()) total += it->second.qty_remaining;
+// ─── Per-operation bookkeeping ────────────────────────────────────────────────
+
+OrderBook::Top OrderBook::top() const noexcept {
+    Top t{0, 0, 0, 0};
+    if (!bids_.empty()) {
+        const PriceLevel* l = bids_.best();
+        t.bid_px  = l->price;
+        t.bid_qty = l->total_qty;
     }
-    return total;
-}
-
-Qty OrderBook::bestAskQty() const {
-    if (asks_.empty()) return 0;
-    Qty total = 0;
-    for (OrderId id : asks_.begin()->second) {
-        auto it = orders_.find(id);
-        if (it != orders_.end()) total += it->second.qty_remaining;
+    if (!asks_.empty()) {
+        const PriceLevel* l = asks_.best();
+        t.ask_px  = l->price;
+        t.ask_qty = l->total_qty;
     }
-    return total;
+    return t;
 }
 
-TOBUpdate OrderBook::makeTOB(Timestamp ts) const {
-    return TOBUpdate{ts, symbol_,
-                     bestBidPrice(), bestBidQty(),
-                     bestAskPrice(), bestAskQty()};
+void OrderBook::beginOp() noexcept {
+    trades_.clear();
+    round_traded_ = false;
 }
 
-bool OrderBook::isCrossed() const {
-    if (bids_.empty() || asks_.empty()) return false;
-    return bids_.begin()->first >= asks_.begin()->first;
+MatchResult OrderBook::finish(MatchResult r, const Top& before) noexcept {
+    r.trades      = TradeSpan(trades_.data(), trades_.size());
+    r.tob_changed = !(top() == before);
+    return r;
 }
 
-// ─── Snapshot helpers (before/after mutation) ─────────────────────────────────
-OrderBook::TOBSnapshot OrderBook::snapshot() const {
-    return {bestBidPrice(), bestAskPrice(), bestBidQty(), bestAskQty()};
+MatchResult OrderBook::reject(RejectReason why, const Top& before) noexcept {
+    MatchResult r;
+    r.status        = OrderStatus::REJECTED;
+    r.reject_reason = why;
+    return finish(r, before);
 }
 
-bool OrderBook::snapshotChanged(const TOBSnapshot& before) const {
-    TOBSnapshot after = snapshot();
-    return (before.bp != after.bp || before.bq != after.bq ||
-            before.ap != after.ap || before.aq != after.aq);
+RejectReason OrderBook::checkNewOrder(OrderId id, Qty qty) const noexcept {
+    if (qty == 0) return RejectReason::INVALID_QUANTITY;
+    if (orders_.find(id) != nullptr) return RejectReason::DUPLICATE_ORDER_ID;
+    return RejectReason::NONE;
 }
 
-// ─── Level management ─────────────────────────────────────────────────────────
-void OrderBook::addToLevel(OrderId id) {
-    const Order& o = orders_.at(id);
-    if (o.side == Side::BUY)
-        bids_[o.price].push_back(id);
-    else
-        asks_[o.price].push_back(id);
+bool OrderBook::wouldCross(Side side, Price price) const noexcept {
+    if (side == Side::BUY) return !asks_.empty() && price >= asks_.bestPrice();
+    return !bids_.empty() && price <= bids_.bestPrice();
 }
 
-void OrderBook::removeFromLevel(OrderId id, Side side, Price price) {
-    if (side == Side::BUY) {
-        auto it = bids_.find(price);
-        if (it == bids_.end()) return;
-        auto& q = it->second;
-        auto  pos = std::find(q.begin(), q.end(), id);
-        if (pos != q.end()) q.erase(pos);
-        if (q.empty()) bids_.erase(it);
-    } else {
-        auto it = asks_.find(price);
-        if (it == asks_.end()) return;
-        auto& q = it->second;
-        auto  pos = std::find(q.begin(), q.end(), id);
-        if (pos != q.end()) q.erase(pos);
-        if (q.empty()) asks_.erase(it);
-    }
-}
-
-// ─── Core matching: BUY aggressor sweeps the ask side ─────────────────────────
-std::vector<Trade> OrderBook::matchBuy(Order& aggressor, Timestamp ts) {
-    std::vector<Trade> trades;
-
-    while (!asks_.empty() && aggressor.qty_remaining > 0) {
-        Price ask_price = asks_.begin()->first;
-
-        // Limit orders only cross up to their limit price.
-        if (aggressor.type == OrderType::LIMIT && aggressor.price < ask_price)
-            break;
-
-        auto& ask_queue = asks_.begin()->second;
-
-        while (!ask_queue.empty() && aggressor.qty_remaining > 0) {
-            OrderId  rest_id = ask_queue.front();
-            Order&   resting = orders_.at(rest_id);
-
-            Qty fill = std::min(aggressor.qty_remaining, resting.qty_remaining);
-
-            trades.push_back(Trade{
-                ts, symbol_, resting.price, fill,
-                Side::BUY, rest_id, aggressor.id
-            });
-            last_trade_price_ = resting.price;
-
-            aggressor.qty_remaining -= fill;
-            resting.qty_remaining   -= fill;
-
-            if (resting.qty_remaining == 0) {
-                resting.status = OrderStatus::FILLED;
-                ask_queue.pop_front();
-                // Keep in orders_ for audit; will not be in any price level.
-            } else {
-                resting.status = OrderStatus::PARTIALLY_FILLED;
-                // Resting order consumed the aggressor completely; stop.
-            }
+bool OrderBook::canFill(Side side, Price limit, bool limited, Qty qty) const noexcept {
+    auto scan = [&](const auto& book) {
+        Qty available = 0;
+        for (std::size_t i = 0; i < book.size(); ++i) {
+            const PriceLevel* l = book.at(i);
+            if (limited && !reaches(side, limit, l->price)) return false;
+            available += l->total_qty;
+            if (available >= qty) return true;
         }
-
-        if (ask_queue.empty())
-            asks_.erase(asks_.begin());
-        else
-            break;   // Best level still has resting qty → aggressor exhausted.
-    }
-
-    aggressor.status = (aggressor.qty_remaining == 0)
-                       ? OrderStatus::FILLED
-                       : (trades.empty() ? OrderStatus::ACTIVE
-                                         : OrderStatus::PARTIALLY_FILLED);
-    return trades;
-}
-
-// ─── Core matching: SELL aggressor sweeps the bid side ────────────────────────
-std::vector<Trade> OrderBook::matchSell(Order& aggressor, Timestamp ts) {
-    std::vector<Trade> trades;
-
-    while (!bids_.empty() && aggressor.qty_remaining > 0) {
-        Price bid_price = bids_.begin()->first;
-
-        if (aggressor.type == OrderType::LIMIT && aggressor.price > bid_price)
-            break;
-
-        auto& bid_queue = bids_.begin()->second;
-
-        while (!bid_queue.empty() && aggressor.qty_remaining > 0) {
-            OrderId rest_id = bid_queue.front();
-            Order&  resting = orders_.at(rest_id);
-
-            Qty fill = std::min(aggressor.qty_remaining, resting.qty_remaining);
-
-            trades.push_back(Trade{
-                ts, symbol_, resting.price, fill,
-                Side::SELL, rest_id, aggressor.id
-            });
-            last_trade_price_ = resting.price;
-
-            aggressor.qty_remaining -= fill;
-            resting.qty_remaining   -= fill;
-
-            if (resting.qty_remaining == 0) {
-                resting.status = OrderStatus::FILLED;
-                bid_queue.pop_front();
-            } else {
-                resting.status = OrderStatus::PARTIALLY_FILLED;
-            }
-        }
-
-        if (bid_queue.empty())
-            bids_.erase(bids_.begin());
-        else
-            break;
-    }
-
-    aggressor.status = (aggressor.qty_remaining == 0)
-                       ? OrderStatus::FILLED
-                       : (trades.empty() ? OrderStatus::ACTIVE
-                                         : OrderStatus::PARTIALLY_FILLED);
-    return trades;
-}
-
-// ─── addLimitInternal ─────────────────────────────────────────────────────────
-// Pure matching logic; does NOT check stop triggers. Called by the public
-// addLimit wrapper and by executeStop (to avoid re-entrant trigger checking).
-MatchResult OrderBook::addLimitInternal(const OrderEvent& event) {
-    if (event.qty == 0) return {};
-
-    Order o;
-    o.id            = event.order_id;
-    o.symbol        = event.symbol;
-    o.side          = event.side;
-    o.type          = OrderType::LIMIT;
-    o.price         = event.price;
-    o.qty_original  = event.qty;
-    o.qty_remaining = event.qty;
-    o.timestamp     = event.timestamp;
-    o.status        = OrderStatus::ACTIVE;
-
-    orders_[o.id] = o;          // register in lookup table first
-
-    auto snap = snapshot();
-
-    std::vector<Trade> trades;
-    if (event.side == Side::BUY)
-        trades = matchBuy (orders_.at(o.id), event.timestamp);
-    else
-        trades = matchSell(orders_.at(o.id), event.timestamp);
-
-    // If unfilled remainder exists, add to the book.
-    if (orders_.at(o.id).qty_remaining > 0)
-        addToLevel(o.id);
-
-    return MatchResult{std::move(trades), snapshotChanged(snap)};
-}
-
-// ─── addMarketInternal ────────────────────────────────────────────────────────
-// Pure matching logic; does NOT check stop triggers.
-MatchResult OrderBook::addMarketInternal(const OrderEvent& event) {
-    if (event.qty == 0) return {};
-
-    Order o;
-    o.id            = event.order_id;
-    o.symbol        = event.symbol;
-    o.side          = event.side;
-    o.type          = OrderType::MARKET;
-    // Market orders match at any price; use extreme sentinels.
-    o.price         = (event.side == Side::BUY) ? INT64_MAX : 0;
-    o.qty_original  = event.qty;
-    o.qty_remaining = event.qty;
-    o.timestamp     = event.timestamp;
-    o.status        = OrderStatus::ACTIVE;
-
-    orders_[o.id] = o;
-
-    auto snap = snapshot();
-
-    std::vector<Trade> trades;
-    if (event.side == Side::BUY)
-        trades = matchBuy (orders_.at(o.id), event.timestamp);
-    else
-        trades = matchSell(orders_.at(o.id), event.timestamp);
-
-    // Market orders never rest; any unfilled qty is silently discarded.
-    if (orders_.at(o.id).qty_remaining > 0)
-        orders_.at(o.id).status = OrderStatus::CANCELLED;
-
-    return MatchResult{std::move(trades), snapshotChanged(snap)};
-}
-
-// ─── cancel ───────────────────────────────────────────────────────────────────
-bool OrderBook::cancel(OrderId id, Timestamp /*ts*/) {
-    auto it = orders_.find(id);
-    if (it == orders_.end()) return false;
-
-    Order& o = it->second;
-    if (o.status == OrderStatus::FILLED || o.status == OrderStatus::CANCELLED)
         return false;
-
-    removeFromLevel(id, o.side, o.price);
-    o.status        = OrderStatus::CANCELLED;
-    o.qty_remaining = 0;
-    return true;
+    };
+    return side == Side::BUY ? scan(asks_) : scan(bids_);
 }
 
-// ─── replace ──────────────────────────────────────────────────────────────────
-// Semantics: cancel original order (loses time priority), submit new limit.
-// Uses the public addLimit so that stop orders are checked after the new limit matches.
-MatchResult OrderBook::replace(const OrderEvent& event) {
-    cancel(event.order_id, event.timestamp);
-
-    OrderEvent neo   = event;
-    neo.order_id     = event.new_order_id;
-    neo.price        = event.new_price;
-    neo.qty          = event.new_qty;
-    neo.type         = OrderType::LIMIT;
-
-    return addLimit(neo);   // public wrapper: matches + checks stops
-}
-
-// ─── addLimit (public wrapper) ────────────────────────────────────────────────
-// Delegates to addLimitInternal then checks for triggered stop orders.
-MatchResult OrderBook::addLimit(const OrderEvent& event) {
-    MatchResult result = addLimitInternal(event);
-    checkAndTriggerStops(result, event.timestamp);
-    return result;
-}
-
-// ─── addMarket (public wrapper) ───────────────────────────────────────────────
-// Delegates to addMarketInternal then checks for triggered stop orders.
-MatchResult OrderBook::addMarket(const OrderEvent& event) {
-    MatchResult result = addMarketInternal(event);
-    checkAndTriggerStops(result, event.timestamp);
-    return result;
-}
-
-// ─── Stop order helpers ───────────────────────────────────────────────────────
-
-bool OrderBook::isStopTriggered(const StopEntry& entry) const {
-    if (last_trade_price_ == 0) return false;   // no trades yet; never trigger
-    if (entry.side == Side::BUY)
-        return last_trade_price_ >= entry.stop_price;
-    else
-        return last_trade_price_ <= entry.stop_price;
-}
-
-// Execute a triggered stop by converting it into a market or limit order.
-// Calls the *Internal variants to avoid re-entrant stop checking.
-// Merges the resulting trades and tob_changed flag into 'accumulated'.
-void OrderBook::executeStop(const StopEntry& entry,
-                            MatchResult& accumulated,
-                            Timestamp ts) {
-    OrderEvent synthetic;
-    synthetic.timestamp = ts;
-    synthetic.symbol    = symbol_;
-    synthetic.order_id  = entry.id;
-    synthetic.side      = entry.side;
-    synthetic.qty       = entry.qty;
-
-    MatchResult sub;
-    if (entry.type == OrderType::STOP_MARKET) {
-        synthetic.type  = OrderType::MARKET;
-        synthetic.price = (entry.side == Side::BUY) ? INT64_MAX : 0;
-        sub = addMarketInternal(synthetic);
+void OrderBook::recordTrade(Price px) noexcept {
+    last_trade_price_ = px;
+    if (!round_traded_) {
+        round_high_   = px;
+        round_low_    = px;
+        round_traded_ = true;
     } else {
-        synthetic.type  = OrderType::LIMIT;
-        synthetic.price = entry.limit_price;
-        sub = addLimitInternal(synthetic);
-    }
-
-    accumulated.trades.insert(
-        accumulated.trades.end(),
-        std::make_move_iterator(sub.trades.begin()),
-        std::make_move_iterator(sub.trades.end())
-    );
-    accumulated.tob_changed |= sub.tob_changed;
-}
-
-// Check and fire any stop orders triggered by the current last_trade_price_.
-// Iterates until no new stops fire (handles cascades where a triggered stop
-// produces trades that trigger further stops).
-void OrderBook::checkAndTriggerStops(MatchResult& accumulated, Timestamp ts) {
-    if (last_trade_price_ == 0) return;   // no trades yet; nothing to check
-
-    bool any_triggered = true;
-    while (any_triggered) {
-        any_triggered = false;
-
-        // Buy stops: trigger when last_trade_price_ >= stop_price.
-        // buy_stops_ is ascending → begin() has the lowest stop_price.
-        while (!buy_stops_.empty() &&
-               last_trade_price_ >= buy_stops_.begin()->first) {
-            auto& q = buy_stops_.begin()->second;
-            while (!q.empty()) {
-                StopEntry entry = q.front();
-                q.pop_front();
-                executeStop(entry, accumulated, ts);
-                any_triggered = true;
-            }
-            buy_stops_.erase(buy_stops_.begin());
-        }
-
-        // Sell stops: trigger when last_trade_price_ <= stop_price.
-        // sell_stops_ is descending → begin() has the highest stop_price.
-        while (!sell_stops_.empty() &&
-               last_trade_price_ <= sell_stops_.begin()->first) {
-            auto& q = sell_stops_.begin()->second;
-            while (!q.empty()) {
-                StopEntry entry = q.front();
-                q.pop_front();
-                executeStop(entry, accumulated, ts);
-                any_triggered = true;
-            }
-            sell_stops_.erase(sell_stops_.begin());
-        }
+        round_high_ = std::max(round_high_, px);
+        round_low_  = std::min(round_low_, px);
     }
 }
 
-// ─── addStop ──────────────────────────────────────────────────────────────────
-// Register a stop order. If the stop is already past the trigger threshold
-// (e.g., the market gapped through it), execute it immediately.
-// Otherwise, enqueue it to fire when price crosses stop_price.
-MatchResult OrderBook::addStop(const OrderEvent& event) {
-    if (event.qty == 0)    return {};
-    if (event.price == 0)  return {};   // stop_price must be non-zero
-    // STOP_LIMIT requires a valid limit price
-    if (event.type == OrderType::STOP_LIMIT && event.limit_price == 0) return {};
+// ─── Matching core ────────────────────────────────────────────────────────────
+//
+// Sweeps the opposite side from the best level outward while the aggressor has
+// quantity and (for limit orders) the level is within its limit.  Fully filled
+// resting orders are unlinked and recycled on the spot; emptied levels are
+// popped off the back of the ladder.  Returns the aggressor's unfilled qty.
+template <class Ladder>
+Qty OrderBook::match(Ladder& book, Side aggressor, Price limit, bool limited, Qty qty,
+                     OrderId id, Timestamp ts) {
+    while (qty > 0 && !book.empty()) {
+        PriceLevel* lvl = book.best();
+        const Price px  = lvl->price;
+        if (limited && !reaches(aggressor, limit, px)) break;
 
-    StopEntry entry{
-        event.order_id,
-        event.type,
-        event.side,
-        event.price,        // stop_price (trigger level)
-        event.limit_price,  // 0 for STOP_MARKET
-        event.qty,
-        event.timestamp
+        do {
+            OrderNode* resting = lvl->head;
+            const Qty  fill    = std::min(qty, resting->qty);
+            trades_.push_back(Trade{ts, symbol_, px, fill, aggressor, resting->id, id});
+            qty            -= fill;
+            resting->qty   -= fill;
+            lvl->total_qty -= fill;
+            if (resting->qty == 0) {
+                lvl->unlink(resting);
+                orders_.erase(resting->id);
+                order_pool_.release(resting);
+            }
+        } while (qty > 0 && !lvl->empty());
+
+        recordTrade(px);
+        if (lvl->empty()) {
+            book.popBest();
+            level_pool_.release(lvl);
+        }
+    }
+    return qty;
+}
+
+void OrderBook::rest(OrderId id, Side side, Price price, Qty qty, TimeInForce tif, Timestamp ts) {
+    OrderNode* n   = order_pool_.acquire();
+    n->id          = id;
+    n->qty         = qty;
+    n->limit_price = 0;
+    n->timestamp   = ts;
+    n->side        = side;
+    n->type        = OrderType::LIMIT;
+    n->tif         = tif;
+    PriceLevel* lvl = side == Side::BUY ? bids_.findOrCreate(price, level_pool_)
+                                        : asks_.findOrCreate(price, level_pool_);
+    lvl->pushBack(n);
+    orders_.insert(id, n);
+}
+
+void OrderBook::removeNode(OrderNode* n) noexcept {
+    PriceLevel* lvl = n->level;
+    lvl->unlink(n);
+    if (lvl->empty()) {
+        if (isStop(n->type)) {
+            if (n->side == Side::BUY) buy_stops_.erase(lvl);
+            else                      sell_stops_.erase(lvl);
+        } else {
+            if (n->side == Side::BUY) bids_.erase(lvl);
+            else                      asks_.erase(lvl);
+        }
+        level_pool_.release(lvl);
+    }
+    if (isStop(n->type)) --pending_stops_;
+    orders_.erase(n->id);
+    order_pool_.release(n);
+}
+
+void OrderBook::executeLimit(OrderId id, Side side, Price price, Qty qty, TimeInForce tif,
+                             Timestamp ts, MatchResult& r) {
+    if (tif == TimeInForce::POST_ONLY && wouldCross(side, price)) {
+        r.status        = OrderStatus::REJECTED;
+        r.reject_reason = RejectReason::POST_ONLY_WOULD_CROSS;
+        return;
+    }
+    if (tif == TimeInForce::FOK && !canFill(side, price, /*limited=*/true, qty)) {
+        r.status = OrderStatus::CANCELLED;
+        return;
+    }
+
+    const Qty remaining = side == Side::BUY ? match(asks_, side, price, true, qty, id, ts)
+                                            : match(bids_, side, price, true, qty, id, ts);
+    r.filled_qty = qty - remaining;
+
+    if (remaining == 0) {
+        r.status = OrderStatus::FILLED;
+    } else if (tif == TimeInForce::IOC || tif == TimeInForce::FOK) {
+        r.status = OrderStatus::CANCELLED;
+    } else {
+        rest(id, side, price, remaining, tif, ts);
+        r.status     = r.filled_qty > 0 ? OrderStatus::PARTIALLY_FILLED : OrderStatus::ACTIVE;
+        r.leaves_qty = remaining;
+    }
+}
+
+void OrderBook::executeMarket(OrderId id, Side side, Qty qty, TimeInForce tif, Timestamp ts,
+                              MatchResult& r) {
+    if (tif == TimeInForce::FOK && !canFill(side, 0, /*limited=*/false, qty)) {
+        r.status = OrderStatus::CANCELLED;
+        return;
+    }
+    const Qty remaining = side == Side::BUY ? match(asks_, side, 0, false, qty, id, ts)
+                                            : match(bids_, side, 0, false, qty, id, ts);
+    r.filled_qty = qty - remaining;
+    r.status     = remaining == 0 ? OrderStatus::FILLED : OrderStatus::CANCELLED;
+}
+
+// ─── Stop orders ──────────────────────────────────────────────────────────────
+//
+// A stop is *elected* by any trade that prints at or through its stop price
+// (buy: price >= stop, sell: price <= stop).  After each operation the range of
+// prices that traded is used to elect stops; elected stops are released in
+// priority order (buy stops lowest-stop first, then sell stops highest-stop
+// first, FIFO within a stop price) as market or limit orders.  Their trades
+// form the next round's range, so cascades resolve iteratively.
+
+template <class Ladder, class Elected>
+void OrderBook::collectStops(Ladder& stops, Elected elected) {
+    while (!stops.empty() && elected(stops.bestPrice())) {
+        PriceLevel* lvl = stops.best();
+        for (OrderNode* n = lvl->head; n != nullptr;) {
+            OrderNode* next = n->next;
+            elected_.push_back(*n);
+            orders_.erase(n->id);
+            order_pool_.release(n);
+            --pending_stops_;
+            n = next;
+        }
+        stops.popBest();
+        level_pool_.release(lvl);
+    }
+}
+
+void OrderBook::releaseStop(const OrderNode& stop, Timestamp ts, MatchResult& r) {
+    if (stop.type == OrderType::STOP_MARKET)
+        executeMarket(stop.id, stop.side, stop.qty, TimeInForce::GTC, ts, r);
+    else
+        executeLimit(stop.id, stop.side, stop.limit_price, stop.qty, TimeInForce::GTC, ts, r);
+}
+
+void OrderBook::runStops(Timestamp ts) {
+    while (round_traded_ && pending_stops_ > 0) {
+        const Price high = round_high_;
+        const Price low  = round_low_;
+        round_traded_    = false;
+
+        elected_.clear();
+        collectStops(buy_stops_,  [high](Price stop) { return stop <= high; });
+        collectStops(sell_stops_, [low](Price stop) { return stop >= low; });
+        if (elected_.empty()) break;
+
+        // releaseStop() never touches elected_, so iterating it here is safe.
+        for (const OrderNode& stop : elected_) {
+            MatchResult released;
+            releaseStop(stop, ts, released);
+        }
+    }
+}
+
+// ─── Public mutations ─────────────────────────────────────────────────────────
+
+MatchResult OrderBook::apply(const OrderEvent& ev) {
+    switch (ev.type) {
+        case OrderType::LIMIT:       return addLimit(ev);
+        case OrderType::MARKET:      return addMarket(ev);
+        case OrderType::CANCEL:      return cancel(ev.order_id);
+        case OrderType::REPLACE:     return replace(ev);
+        case OrderType::STOP_MARKET:
+        case OrderType::STOP_LIMIT:  return addStop(ev);
+    }
+    beginOp();   // unreachable for valid enum values
+    return reject(RejectReason::NONE, top());
+}
+
+MatchResult OrderBook::addLimit(const OrderEvent& ev) {
+    const Top before = top();
+    beginOp();
+    if (const RejectReason why = checkNewOrder(ev.order_id, ev.qty); why != RejectReason::NONE)
+        return reject(why, before);
+    if (ev.price <= 0) return reject(RejectReason::INVALID_PRICE, before);
+
+    MatchResult r;
+    executeLimit(ev.order_id, ev.side, ev.price, ev.qty, ev.tif, ev.timestamp, r);
+    runStops(ev.timestamp);
+    return finish(r, before);
+}
+
+MatchResult OrderBook::addMarket(const OrderEvent& ev) {
+    const Top before = top();
+    beginOp();
+    if (const RejectReason why = checkNewOrder(ev.order_id, ev.qty); why != RejectReason::NONE)
+        return reject(why, before);
+    if (ev.tif == TimeInForce::POST_ONLY) return reject(RejectReason::INVALID_TIME_IN_FORCE, before);
+
+    MatchResult r;
+    executeMarket(ev.order_id, ev.side, ev.qty, ev.tif, ev.timestamp, r);
+    runStops(ev.timestamp);
+    return finish(r, before);
+}
+
+MatchResult OrderBook::addStop(const OrderEvent& ev) {
+    const Top before = top();
+    beginOp();
+    if (const RejectReason why = checkNewOrder(ev.order_id, ev.qty); why != RejectReason::NONE)
+        return reject(why, before);
+    if (ev.price <= 0) return reject(RejectReason::INVALID_PRICE, before);
+    if (ev.type == OrderType::STOP_LIMIT && ev.limit_price <= 0)
+        return reject(RejectReason::INVALID_PRICE, before);
+
+    OrderNode stop;
+    stop.id          = ev.order_id;
+    stop.qty         = ev.qty;
+    stop.limit_price = ev.type == OrderType::STOP_LIMIT ? ev.limit_price : 0;
+    stop.timestamp   = ev.timestamp;
+    stop.side        = ev.side;
+    stop.type        = ev.type;
+
+    MatchResult r;
+    // The market has already traded through the stop: release immediately.
+    // (No trade yet → the stop simply waits; there is no reference price.)
+    const bool already_elected =
+        last_trade_price_ != 0 &&
+        (ev.side == Side::BUY ? last_trade_price_ >= ev.price : last_trade_price_ <= ev.price);
+    if (already_elected) {
+        releaseStop(stop, ev.timestamp, r);
+        runStops(ev.timestamp);
+        return finish(r, before);
+    }
+
+    OrderNode* n = order_pool_.acquire();
+    *n           = stop;
+    PriceLevel* lvl = ev.side == Side::BUY ? buy_stops_.findOrCreate(ev.price, level_pool_)
+                                           : sell_stops_.findOrCreate(ev.price, level_pool_);
+    lvl->pushBack(n);
+    orders_.insert(n->id, n);
+    ++pending_stops_;
+
+    r.status     = OrderStatus::ACTIVE;
+    r.leaves_qty = ev.qty;
+    return finish(r, before);
+}
+
+MatchResult OrderBook::cancel(OrderId id) {
+    const Top before = top();
+    beginOp();
+    OrderNode* n = orders_.find(id);
+    if (n == nullptr) return reject(RejectReason::UNKNOWN_ORDER, before);
+    removeNode(n);
+    MatchResult r;
+    r.status = OrderStatus::CANCELLED;
+    return finish(r, before);
+}
+
+// Cancel/replace of a resting limit order.  Side and time-in-force are taken
+// from the original order.  A replace that keeps the price and does not
+// increase the quantity is applied in place and keeps time priority (as on
+// most exchanges); anything else cancels the original and enters a new order
+// at the back of the queue, which may trade immediately.  The request is
+// validated in full before the original is touched, so a rejected replace
+// leaves the book unchanged.
+MatchResult OrderBook::replace(const OrderEvent& ev) {
+    const Top before = top();
+    beginOp();
+    OrderNode* n = orders_.find(ev.order_id);
+    if (n == nullptr || n->type != OrderType::LIMIT) return reject(RejectReason::UNKNOWN_ORDER, before);
+    if (ev.new_qty == 0)    return reject(RejectReason::INVALID_QUANTITY, before);
+    if (ev.new_price <= 0)  return reject(RejectReason::INVALID_PRICE, before);
+    const OrderId new_id = ev.new_order_id;
+    if (new_id != n->id && orders_.find(new_id) != nullptr)
+        return reject(RejectReason::DUPLICATE_ORDER_ID, before);
+
+    MatchResult r;
+    if (ev.new_price == n->level->price && ev.new_qty <= n->qty) {
+        n->level->total_qty -= n->qty - ev.new_qty;
+        n->qty = ev.new_qty;
+        if (new_id != n->id) {
+            orders_.erase(n->id);
+            n->id = new_id;
+            orders_.insert(new_id, n);
+        }
+        r.status     = OrderStatus::ACTIVE;
+        r.leaves_qty = n->qty;
+        return finish(r, before);
+    }
+
+    const Side        side = n->side;
+    const TimeInForce tif  = n->tif;
+    if (tif == TimeInForce::POST_ONLY && wouldCross(side, ev.new_price))
+        return reject(RejectReason::POST_ONLY_WOULD_CROSS, before);
+
+    removeNode(n);
+    executeLimit(new_id, side, ev.new_price, ev.new_qty, tif, ev.timestamp, r);
+    runStops(ev.timestamp);
+    return finish(r, before);
+}
+
+// ─── Queries ──────────────────────────────────────────────────────────────────
+
+TOBUpdate OrderBook::makeTOB(Timestamp ts) const noexcept {
+    const Top t = top();
+    return TOBUpdate{ts, symbol_, t.bid_px, t.bid_qty, t.ask_px, t.ask_qty};
+}
+
+bool OrderBook::isCrossed() const noexcept {
+    return !bids_.empty() && !asks_.empty() && bids_.bestPrice() >= asks_.bestPrice();
+}
+
+std::optional<OrderInfo> OrderBook::findOrder(OrderId id) const {
+    const OrderNode* n = orders_.find(id);
+    if (n == nullptr) return std::nullopt;
+    return OrderInfo{n->id, n->side, n->type, n->tif, n->level->price, n->limit_price, n->qty,
+                     n->timestamp};
+}
+
+std::vector<DepthLevel> OrderBook::depth(Side side, std::size_t max_levels) const {
+    std::vector<DepthLevel> out;
+    auto collect = [&](const auto& book) {
+        const std::size_t n = std::min(max_levels, book.size());
+        out.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const PriceLevel* l = book.at(i);
+            out.push_back(DepthLevel{l->price, l->total_qty, l->order_count});
+        }
+    };
+    if (side == Side::BUY) collect(bids_);
+    else                   collect(asks_);
+    return out;
+}
+
+bool OrderBook::validate(std::string* error) const {
+    std::string msg;
+    std::size_t nodes  = 0;
+    std::size_t stops  = 0;
+    std::size_t levels = 0;
+
+    auto check_ladder = [&](const auto& ladder, Side side, bool stop_ladder, const char* name) {
+        for (std::size_t i = 0; i < ladder.size(); ++i) {
+            const PriceLevel* l = ladder.at(i);
+            const std::string where = std::string(name) + " level " + std::to_string(l->price);
+            if (i > 0 && !ladder.isBetter(ladder.at(i - 1)->price, l->price)) {
+                msg = where + ": levels not strictly ordered";
+                return false;
+            }
+            if (l->empty()) {
+                msg = where + ": empty level left in ladder";
+                return false;
+            }
+            Qty              sum   = 0;
+            std::uint32_t    count = 0;
+            const OrderNode* prev  = nullptr;
+            for (const OrderNode* n = l->head; n != nullptr; n = n->next) {
+                const std::string who = where + " order " + std::to_string(n->id);
+                if (n->level != l)                 { msg = who + ": bad level back-pointer"; return false; }
+                if (n->prev != prev)               { msg = who + ": broken prev link"; return false; }
+                if (n->side != side)               { msg = who + ": on the wrong side"; return false; }
+                if (n->qty == 0)                   { msg = who + ": zero open quantity"; return false; }
+                if (isStop(n->type) != stop_ladder) { msg = who + ": wrong order type for ladder"; return false; }
+                if (orders_.find(n->id) != n)      { msg = who + ": missing from id map"; return false; }
+                sum += n->qty;
+                ++count;
+                prev = n;
+            }
+            if (l->tail != prev)        { msg = where + ": bad tail pointer"; return false; }
+            if (sum != l->total_qty)    { msg = where + ": total_qty mismatch"; return false; }
+            if (count != l->order_count) { msg = where + ": order_count mismatch"; return false; }
+            nodes += count;
+            if (stop_ladder) stops += count;
+            ++levels;
+        }
+        return true;
     };
 
-    if (isStopTriggered(entry)) {
-        // Price has already crossed the stop_price; fire immediately.
-        MatchResult result;
-        executeStop(entry, result, event.timestamp);
-        checkAndTriggerStops(result, event.timestamp);  // handle cascade
-        return result;
+    const bool ok = check_ladder(bids_, Side::BUY, false, "bid") &&
+                    check_ladder(asks_, Side::SELL, false, "ask") &&
+                    check_ladder(buy_stops_, Side::BUY, true, "buy-stop") &&
+                    check_ladder(sell_stops_, Side::SELL, true, "sell-stop");
+    if (ok) {
+        if (nodes != orders_.size())             msg = "id map size does not match linked orders";
+        else if (stops != pending_stops_)        msg = "pending stop count mismatch";
+        else if (order_pool_.inUse() != nodes)   msg = "order pool leak";
+        else if (level_pool_.inUse() != levels)  msg = "price level pool leak";
+        else if (isCrossed())                    msg = "book is crossed";
     }
-
-    // Enqueue for future triggering.
-    if (event.side == Side::BUY)
-        buy_stops_[event.price].push_back(entry);
-    else
-        sell_stops_[event.price].push_back(entry);
-
-    return {};  // stop is resting; no immediate trades, no TOB change
+    if (msg.empty()) return true;
+    if (error != nullptr) *error = msg;
+    return false;
 }
+
+}  // namespace lob

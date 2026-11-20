@@ -1,65 +1,54 @@
-#include "MatchingEngine.h"
+#include "lob/MatchingEngine.h"
 
-// ─────────────────────────────────────────────────────────────────────────────
-OrderBook& MatchingEngine::getOrCreateBook(const std::string& symbol) {
-    auto it = books_.find(symbol);
-    if (it != books_.end()) return it->second;
-    // emplace returns pair<iterator,bool>; use piecewise to avoid copy.
-    auto [ins, _] = books_.emplace(symbol, OrderBook(symbol));
-    return ins->second;
+namespace lob {
+
+OrderBook* MatchingEngine::getBook(const Symbol& symbol) noexcept {
+    if (cached_book_ != nullptr && cached_symbol_ == symbol) return cached_book_;
+    const auto it = books_.find(symbol);
+    if (it == books_.end()) return nullptr;
+    cached_symbol_ = symbol;
+    cached_book_   = it->second.get();
+    return cached_book_;
 }
 
-OrderBook* MatchingEngine::getBook(const std::string& symbol) {
-    auto it = books_.find(symbol);
-    return (it != books_.end()) ? &it->second : nullptr;
+const OrderBook* MatchingEngine::getBook(const Symbol& symbol) const noexcept {
+    const auto it = books_.find(symbol);
+    return it == books_.end() ? nullptr : it->second.get();
 }
 
-// ─── Publish callbacks ────────────────────────────────────────────────────────
-void MatchingEngine::publish(const MatchResult& result,
-                             const std::string& symbol,
-                             Timestamp ts) {
-    if (trade_handler_) {
-        for (const Trade& t : result.trades)
-            trade_handler_(t);
-    }
-
-    if (tob_handler_ && result.tob_changed) {
-        OrderBook* book = getBook(symbol);
-        if (book) tob_handler_(book->makeTOB(ts));
-    }
+OrderBook* MatchingEngine::getBook(std::string_view symbol) noexcept {
+    Symbol s;
+    return Symbol::tryParse(symbol, s) ? getBook(s) : nullptr;
 }
 
-// ─── Main dispatch ────────────────────────────────────────────────────────────
-void MatchingEngine::processEvent(const OrderEvent& event) {
-    OrderBook& book = getOrCreateBook(event.symbol);
-    MatchResult result;
+OrderBook& MatchingEngine::getOrCreateBook(const Symbol& symbol) {
+    if (OrderBook* book = getBook(symbol)) return *book;
+    auto [it, inserted] =
+        books_.emplace(symbol, std::make_unique<OrderBook>(symbol, expected_orders_));
+    (void)inserted;
+    cached_symbol_ = symbol;
+    cached_book_   = it->second.get();
+    return *cached_book_;
+}
 
-    switch (event.type) {
-        case OrderType::LIMIT:
-            result = book.addLimit(event);
-            break;
-
-        case OrderType::MARKET:
-            result = book.addMarket(event);
-            break;
-
-        case OrderType::CANCEL: {
-            bool cancelled = book.cancel(event.order_id, event.timestamp);
-            if (cancelled) {
-                result.tob_changed = true;   // conservative; publisher may skip
-            }
-            break;
+MatchResult MatchingEngine::processEvent(const OrderEvent& event) {
+    OrderBook* book = getBook(event.symbol);
+    if (book == nullptr) {
+        if (event.type == OrderType::CANCEL || event.type == OrderType::REPLACE) {
+            MatchResult r;
+            r.status        = OrderStatus::REJECTED;
+            r.reject_reason = RejectReason::UNKNOWN_ORDER;
+            return r;
         }
-
-        case OrderType::REPLACE:
-            result = book.replace(event);
-            break;
-
-        case OrderType::STOP_MARKET:   // fall-through: both routed to addStop
-        case OrderType::STOP_LIMIT:
-            result = book.addStop(event);
-            break;
+        book = &getOrCreateBook(event.symbol);
     }
 
-    publish(result, event.symbol, event.timestamp);
+    const MatchResult result = book->apply(event);
+
+    if (trade_handler_)
+        for (const Trade& t : result.trades) trade_handler_(t);
+    if (result.tob_changed && tob_handler_) tob_handler_(book->makeTOB(event.timestamp));
+    return result;
 }
+
+}  // namespace lob
