@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux / GCC
+            os: ubuntu-latest
+            cmake_args: -DCMAKE_CXX_COMPILER=g++
+          - name: Linux / Clang
+            os: ubuntu-latest
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DLOB_WARNINGS_AS_ERRORS=ON
+          - name: macOS / Apple Clang
+            os: macos-latest
+            cmake_args: -DLOB_WARNINGS_AS_ERRORS=ON
+          - name: Windows / MSVC
+            os: windows-latest
+            cmake_args: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test (unit + differential fuzz + golden replay + benchmark smoke)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  sanitizers:
+    name: Linux / Clang / ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++
+          -DLOB_ENABLE_SANITIZERS=ON -DLOB_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1
